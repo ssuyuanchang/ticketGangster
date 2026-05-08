@@ -33,6 +33,16 @@ class StrategyCfg:
     use_server_time: bool = True
     auto_agree: bool = True
     auto_submit: bool = True
+    # 從 attack 開始之後，最多持續搶多久 (分鐘)。超時就放棄並關閉。
+    # 適用情境: 90 分鐘還沒搶到通常代表這場已售完, 不如停下來。
+    attack_duration_minutes: int = 90
+    # 送出表單後等付款頁出現的 timeout (秒)。超時 = 卡 queue 或網路問題,
+    # 此時放棄這次提交並刷新報名頁重新來過。預設 45 秒。
+    payment_wait_timeout_seconds: int = 45
+    # refresh_interval_ms 的 jitter 百分比 (0~100)。每次 sleep 以
+    # `refresh_interval_ms * (1 ± pct/100)` 隨機抖動，避免被偵測成 bot
+    # 規律行為。預設 20 = ±20%。
+    refresh_jitter_pct: int = 20
 
 
 @dataclass
@@ -92,6 +102,9 @@ def load(path: str | Path) -> Config:
             use_server_time=bool(st.get("use_server_time", True)),
             auto_agree=bool(st.get("auto_agree", True)),
             auto_submit=bool(st.get("auto_submit", True)),
+            attack_duration_minutes=int(st.get("attack_duration_minutes", 90)),
+            payment_wait_timeout_seconds=int(st.get("payment_wait_timeout_seconds", 45)),
+            refresh_jitter_pct=int(st.get("refresh_jitter_pct", 20)),
         ),
         browser=BrowserCfg(
             user_data_dir=Path(br.get("user_data_dir", "./profile")).expanduser().resolve(),
@@ -111,5 +124,11 @@ def load(path: str | Path) -> Config:
         raise ValueError("ticket.quantity 必須在 1~4 之間 (KKTIX 單筆上限)")
     if cfg.strategy.parallel_tabs < 1:
         cfg.strategy.parallel_tabs = 1
+    if cfg.strategy.attack_duration_minutes < 1:
+        raise ValueError("strategy.attack_duration_minutes 必須 >= 1")
+    if cfg.strategy.payment_wait_timeout_seconds < 5:
+        raise ValueError("strategy.payment_wait_timeout_seconds 必須 >= 5")
+    if not (0 <= cfg.strategy.refresh_jitter_pct <= 80):
+        raise ValueError("strategy.refresh_jitter_pct 必須在 0~80 之間")
 
     return cfg

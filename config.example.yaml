@@ -41,8 +41,13 @@ strategy:
   # 啟售前多少毫秒開始攻擊（refresh / 點擊）
   attack_lead_ms: 200
 
-  # 每次刷新間隔 (ms)
-  refresh_interval_ms: 150
+  # 每次刷新間隔 (ms) — 太快 (<150) 容易被 Cloudflare/CF 標記為 bot
+  # 一般場次 200ms, 極熱門 (G-DRAGON 等級) 可拉到 250~350
+  refresh_interval_ms: 200
+
+  # 刷新間隔的隨機抖動 (±百分比) — 讓間隔不規律, 進一步降低 bot 偵測風險
+  # 0 = 不抖動 (機械式), 20 = ±20% (推薦), 上限 80
+  refresh_jitter_pct: 20
 
   # 同時開幾個分頁衝（1~5；越多越吃 CPU/網路，但成功率更高）
   parallel_tabs: 1
@@ -55,6 +60,15 @@ strategy:
 
   # 搶到後是否自動點「下一步 / 確認」按鈕送出表單
   auto_submit: true
+
+  # 從 attack 開始之後最多搶多久 (分鐘) — 超時就放棄並退出
+  # 90 分鐘還沒搶到通常代表這場已售完, 不如停下來
+  attack_duration_minutes: 90
+
+  # 送出表單後等付款頁出現的 timeout (秒) — 超時 = 卡 queue 或網路問題,
+  # 此時放棄這次提交並刷新報名頁重新搶 (注意: 可能放棄 KKTIX 已鎖定的座位)
+  # 經驗值: 一般場次 30s, 通用 45s (預設), G-DRAGON 等級可拉到 60s
+  payment_wait_timeout_seconds: 45
 
 # ----------------------------------------------------------------------
 # 瀏覽器設定

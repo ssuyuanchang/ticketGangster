@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +29,15 @@ from src import config as cfg_mod
 from src import kktix
 from src import logger as log
 from src import time_sync
+
+
+class FormResult(str, Enum):
+    """`handle_registration_form` 的執行結果, 用來決定外層迴圈下一步。"""
+    SUBMITTED = "submitted"            # 已送出表單, 進入等付款頁階段
+    SOLD_OUT = "sold_out"              # 目標票價售完, 應刷新重試
+    NOT_FOUND = "not_found"            # 頁面找不到 config 票價, 放棄
+    TRANSIENT_FAIL = "transient_fail"  # 點 + / submit 動作失敗 (race?), 應刷新重試
+    MANUAL = "manual"                  # auto_submit=false, 等使用者手動操作
 
 
 # ---------------------------------------------------------------------------
@@ -62,24 +73,47 @@ def busy_wait_until(clock: time_sync.Clock, target_ts: float) -> None:
         pass
 
 
+def jittered_interval(base_s: float, pct: int) -> float:
+    """回傳 base_s * (1 ± pct%) 的隨機值, 用來打破固定間隔的機械感。
+
+    pct = 20 → 抖動範圍 [0.8 * base_s, 1.2 * base_s]
+    pct = 0  → 不抖動 (回原值)
+    """
+    if pct <= 0:
+        return base_s
+    factor = 1.0 + random.uniform(-pct, pct) / 100.0
+    return max(0.0, base_s * factor)
+
+
 # ---------------------------------------------------------------------------
 # 報名頁處理 (選票 + 送出)
 # ---------------------------------------------------------------------------
 
-def handle_registration_form(page: Page, cfg: cfg_mod.Config) -> bool:
-    """到達報名頁後，自動選票 + 送出。回傳是否成功送出表單。"""
-    log.step("解析票種...")
+def handle_registration_form(page: Page, cfg: cfg_mod.Config) -> FormResult:
+    """已在報名頁時, 嘗試選票+勾同意+送出。回傳 FormResult 讓外層決定下一步。
+
+    回傳值:
+      SUBMITTED       — 已送出表單, 接下來等付款頁
+      SOLD_OUT        — 目標票售完, 外層應 sleep+刷新重試
+      NOT_FOUND       — config 票價在頁面上不存在, 外層應放棄
+      TRANSIENT_FAIL  — 選張數/送出動作失敗 (race), 外層應刷新重試
+      MANUAL          — auto_submit=false, 完成選票後交給使用者
+    """
+    candidates = [cfg.ticket.price] + cfg.ticket.fallback_prices
+
     rows = kktix.parse_ticket_rows(page)
     if not rows:
-        log.err("  找不到任何票種 select，可能頁面結構不同或未成功進入報名頁")
-        return False
+        # 沒任何可購買的票 — 全售完還是頁面爛掉?
+        status, seen = kktix.check_target_price_status(page, candidates)
+        log.warn(f"  無可購買票種 (頁面看到的價格: {seen})")
+        if status == kktix.TicketStatus.SOLD_OUT:
+            return FormResult.SOLD_OUT
+        return FormResult.NOT_FOUND
 
-    log.info(f"  找到 {len(rows)} 個票種:")
+    log.info(f"  找到 {len(rows)} 個可購買票種:")
     for r in rows:
-        log.info(f"    - {r.name}  價格={r.price}  上限={r.max_quantity}")
+        log.info(f"    - {r.name}  NT${r.price}  上限={r.max_quantity}")
 
-    # 依優先序嘗試: 主票價 + fallback
-    candidates = [cfg.ticket.price] + cfg.ticket.fallback_prices
     chosen: Optional[kktix.TicketRow] = None
     for price in candidates:
         row = kktix.pick_ticket_row(rows, price)
@@ -89,28 +123,34 @@ def handle_registration_form(page: Page, cfg: cfg_mod.Config) -> bool:
             break
 
     if chosen is None:
-        log.err(f"  找不到指定票價 {cfg.ticket.price} (含 fallback {cfg.ticket.fallback_prices})")
-        log.warn("  可能價格寫錯，或這場次的票種跟設定的不同")
-        return False
+        # 目標票價在「可購買」清單裡找不到, 看是售完還是 config 錯
+        status, seen = kktix.check_target_price_status(page, candidates)
+        if status == kktix.TicketStatus.SOLD_OUT:
+            log.warn(f"  目標票價 {candidates} 售完 (頁面看到: {seen})")
+            return FormResult.SOLD_OUT
+        log.err(f"  找不到指定票價 {candidates} (頁面看到: {seen})")
+        log.warn("  可能 config 寫錯, 或票種命名與設定不同, 放棄此場次")
+        return FormResult.NOT_FOUND
 
     log.step(f"設定數量 = {cfg.ticket.quantity}")
     if not kktix.select_quantity(chosen, cfg.ticket.quantity):
-        return False
+        log.warn("  設定數量失敗 (race? 票種瞬間售完?)")
+        return FormResult.TRANSIENT_FAIL
 
     if cfg.strategy.auto_agree:
         n = kktix.agree_terms(page)
         log.info(f"  勾選了 {n} 個同意條款 checkbox")
 
-    if cfg.strategy.auto_submit:
-        log.step("送出表單")
-        if not kktix.submit(page):
-            log.err("  找不到送出按鈕")
-            return False
-        log.ok("  已送出")
-    else:
+    if not cfg.strategy.auto_submit:
         log.warn("  auto_submit=false，請手動點下一步")
+        return FormResult.MANUAL
 
-    return True
+    log.step("送出表單")
+    if not kktix.submit(page):
+        log.warn("  找不到送出按鈕 (可能尚未變 enabled)")
+        return FormResult.TRANSIENT_FAIL
+    log.ok("  已送出")
+    return FormResult.SUBMITTED
 
 
 # ---------------------------------------------------------------------------
@@ -145,43 +185,80 @@ def run_single_tab(
     countdown(clock, attack_at)
     busy_wait_until(clock, attack_at)
 
-    # ---- 3. 衝擊報名頁 ----
+    # ---- 3. 衝擊報名頁 (持續刷新, 直到搶到、deadline 到、或 config 錯放棄) ----
     log.ok(f"[T{tab_id}] >>> ATTACK <<<")
-    attempts = 0
-    interval = cfg.strategy.refresh_interval_ms / 1000.0
-    max_attempts = 200  # 約 30s @ 150ms
+    interval_s = cfg.strategy.refresh_interval_ms / 1000.0
+    jitter_pct = cfg.strategy.refresh_jitter_pct
+    duration_s = cfg.strategy.attack_duration_minutes * 60.0
+    payment_timeout_s = cfg.strategy.payment_wait_timeout_seconds
+    attack_start = time.time()
+    deadline = attack_start + duration_s
+    log.info(f"[T{tab_id}] 最多搶 {cfg.strategy.attack_duration_minutes} 分鐘, "
+             f"刷新間隔 {cfg.strategy.refresh_interval_ms}ms ±{jitter_pct}%, "
+             f"送出後等付款頁 timeout = {payment_timeout_s}s")
 
-    while attempts < max_attempts:
-        attempts += 1
+    enter_attempts = 0   # 進入報名頁次數
+    submit_attempts = 0  # 成功送出次數 (含等付款頁逾時要重試的)
+
+    while time.time() < deadline:
+        # --- (a) 進入報名頁 ---
+        enter_attempts += 1
         t0 = time.time()
-        success = kktix.try_enter_registration(page, event_url, register_url)
-        dt = (time.time() - t0) * 1000
-        if success:
-            log.ok(f"[T{tab_id}] 第 {attempts} 次嘗試成功進入報名頁 ({dt:.0f}ms)")
-            break
-        if attempts % 5 == 0:
-            log.warn(f"[T{tab_id}] 第 {attempts} 次嘗試失敗，繼續...")
-        # 精準間隔
-        sleep_left = interval - (time.time() - t0)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
-    else:
-        log.err(f"[T{tab_id}] {max_attempts} 次嘗試都進不去報名頁")
-        return False
+        entered = kktix.try_enter_registration(page, event_url, register_url)
+        if not entered:
+            if enter_attempts % 10 == 0:
+                elapsed = time.time() - attack_start
+                remain = deadline - time.time()
+                log.warn(f"[T{tab_id}] 進報名頁失敗 #{enter_attempts}, "
+                         f"已過 {elapsed:.0f}s, 剩 {remain:.0f}s")
+            # 用 jitter 後的間隔精準補齊 (避免被偵測成定時打點)
+            target_interval = jittered_interval(interval_s, jitter_pct)
+            sleep_left = target_interval - (time.time() - t0)
+            if sleep_left > 0:
+                time.sleep(sleep_left)
+            continue
+        log.ok(f"[T{tab_id}] 進入報名頁 (第 {enter_attempts} 次嘗試, "
+               f"{(time.time()-t0)*1000:.0f}ms): {page.url}")
 
-    # ---- 4. 處理報名表 ----
-    if not handle_registration_form(page, cfg):
-        return False
+        # --- (b) 解析票種 + 選票 + 送出 ---
+        result = handle_registration_form(page, cfg)
 
-    # ---- 5. 等付款頁 ----
-    log.step(f"[T{tab_id}] 等待付款頁 ...")
-    if kktix.wait_for_payment(page, timeout_s=30):
-        log.ok(f"[T{tab_id}] >>> 已進入付款頁: {page.url}")
-        return True
+        if result == FormResult.NOT_FOUND:
+            # config 寫錯 (頁面上根本沒這個價錢) — 不刷新, 直接放棄
+            return False
+        if result == FormResult.MANUAL:
+            log.info(f"[T{tab_id}] auto_submit=false, 等使用者手動接手")
+            return True
+        if result == FormResult.SOLD_OUT:
+            log.warn(f"[T{tab_id}] 售完, 刷新報名頁繼續等釋票...")
+            time.sleep(jittered_interval(interval_s, jitter_pct))
+            continue
+        if result == FormResult.TRANSIENT_FAIL:
+            log.warn(f"[T{tab_id}] 下單動作失敗 (race?), 刷新重試")
+            time.sleep(jittered_interval(interval_s, jitter_pct))
+            continue
 
-    # 即使沒偵測到付款 URL，也可能成功（顯示在某個訂單頁），交給人類確認
-    log.warn(f"[T{tab_id}] 沒有明確偵測到付款頁，但已送出。當前 URL: {page.url}")
-    return True
+        # result == SUBMITTED — 等付款頁
+        submit_attempts += 1
+        log.step(f"[T{tab_id}] 等付款頁 (timeout {payment_timeout_s}s)...")
+        if kktix.wait_for_payment(page, timeout_s=payment_timeout_s):
+            log.ok(f"[T{tab_id}] >>> 已進入付款頁: {page.url}")
+            return True
+
+        # 等太久 — 卡 queue / 網路問題. 放棄這次提交, 刷新重新搶
+        # 注意: 此舉可能放棄 KKTIX 已經為我們鎖定的座位
+        log.warn(f"[T{tab_id}] 送出後 {payment_timeout_s}s 仍未進付款頁, "
+                 f"當前 URL: {page.url}")
+        log.warn(f"[T{tab_id}] 可能卡在等候室或網路問題, 刷新報名頁重新嘗試 "
+                 f"(已成功送出 {submit_attempts} 次)")
+        # 不 sleep, 直接下一輪, 下輪會 page.goto(register_url) = 強制刷新
+
+    # deadline 到
+    elapsed = time.time() - attack_start
+    log.err(f"[T{tab_id}] {cfg.strategy.attack_duration_minutes} 分鐘到 "
+            f"(進入報名頁 {enter_attempts} 次, 送出 {submit_attempts} 次, "
+            f"共 {elapsed:.0f}s) 仍未搶到, 放棄")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +306,7 @@ def main() -> int:
     if cfg.ticket.fallback_prices:
         log.info(f"  備援票價: {cfg.ticket.fallback_prices}")
     log.info(f"  並行分頁: {cfg.strategy.parallel_tabs}")
+    log.info(f"  最長搶票時間: {cfg.strategy.attack_duration_minutes} 分鐘")
     log.info(f"  Profile: {cfg.browser.user_data_dir}")
     log.info("")
 
